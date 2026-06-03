@@ -67,12 +67,68 @@ Copy `.env.example` to `.env.local` and fill in what you want:
 Then apply the database schema:
 
 ```bash
-# via the Supabase SQL editor, paste:
+# via the Supabase SQL editor, paste in order:
 supabase/migrations/0001_init.sql
+supabase/migrations/0002_payments.sql
 ```
 
 The unique index on `wallet_address` is what makes "one wish per wallet"
 unbreakable — even under a race, the second insert is rejected.
+
+---
+
+## Paid wishes + buy-and-burn (optional)
+
+Set a treasury and every wish costs **6.99 USDC**, paid on-chain from the
+seeker's connected wallet. Every **3rd** paid wish, the treasury automatically
+swaps **90%** of its USDC into the willow token via Jupiter and **burns** it,
+keeping **10% back for fees**. Leave `TREASURY_SECRET_KEY` empty to keep wishes
+free.
+
+| Key | Purpose |
+| --- | --- |
+| `TREASURY_SECRET_KEY` | **Server-only.** base58 or JSON byte array. Its public key is the payment address. Never commit a funded key. |
+| `WISH_PRICE_USDC` | Price per wish (default `6.99`). |
+| `WISH_TOKEN_MINT` | Token bought & burned (default `2Vkp…pump`). |
+| `BURN_EVERY` | Buy & burn every N paid wishes (default `3`). |
+| `FEE_RESERVE_RATIO` | USDC kept back for fees each burn (default `0.10`). |
+| `JUPITER_API_URL` / `JUPITER_API_KEY` | Swap routing (defaults to the free lite endpoint). |
+| `SOLANA_RPC` | Server RPC for verification + burns (a private RPC is strongly recommended on mainnet). |
+| `CRON_SECRET` | Bearer token guarding `POST /api/buyburn`. |
+
+Generate a fresh treasury keypair (base58 secret) and fund it with a little SOL
+for fees:
+
+```bash
+node -e "const {Keypair}=require('@solana/web3.js');const bs58=require('bs58');console.log(bs58.default.encode(Keypair.generate().secretKey))"
+```
+
+**Flow:** connect wallet → write wish → `Offer 6.99 USDC & wish` prompts a USDC
+transfer to the treasury → the server verifies the signature on-chain (correct
+mint, amount, destination, signer; replay-protected by a unique constraint) →
+the wish is recorded.
+
+**Reliable burns (cron).** Burns are tracked as *owed* — `floor(paidWishes / 3)`
+minus the burns that have actually completed — so one that gets cut off mid-run
+stays owed and is retried, never double-burned (an in-process lock + the owed
+count guard against concurrency). A burn fires inline when a wish trips the
+threshold, and `vercel.json` schedules an hourly **Vercel Cron** as a backstop:
+
+```json
+{ "crons": [{ "path": "/api/cron/buyburn", "schedule": "0 * * * *" }] }
+```
+
+You **must** set `CRON_SECRET` in your Vercel project — Vercel auto-sends it as
+`Authorization: Bearer <CRON_SECRET>` and the route rejects anything else. (Note:
+Vercel's Hobby plan runs crons at most once/day; Pro honors the hourly schedule.)
+Test it locally with:
+
+```bash
+curl -H "Authorization: Bearer $CRON_SECRET" http://localhost:3000/api/cron/buyburn
+```
+
+Check `GET /api/buyburn` for paid-wish count, `pendingBurns`, the next burn, and
+burn history. `POST /api/buyburn` (same `CRON_SECRET`) forces an immediate run.
 
 ---
 

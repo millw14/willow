@@ -2,16 +2,17 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
-import { useWallet } from "@solana/wallet-adapter-react";
+import { useWallet, useConnection } from "@solana/wallet-adapter-react";
 import { FloatingBox, type BoxState } from "@/components/scene/FloatingBox";
 import { WalletButton } from "@/components/ui/WalletButton";
 import { useWishStatus } from "@/hooks/useWishStatus";
 import { ShareCard } from "@/components/share/ShareCard";
 import { wishHash, sleep, truncateAddress } from "@/lib/utils";
-import type { CreateWishResult } from "@/lib/types";
+import { getTreasuryConfig, payForWish } from "@/lib/payClient";
+import type { CreateWishResult, TreasuryConfig } from "@/lib/types";
 import * as sound from "@/lib/sound";
 
-type Phase = "gate" | "write" | "sequence" | "revealed" | "remembers";
+type Phase = "gate" | "write" | "pay" | "sequence" | "revealed" | "remembers";
 
 interface WishRitualProps {
   onClose: () => void;
@@ -19,7 +20,8 @@ interface WishRitualProps {
 }
 
 export function WishRitual({ onClose, onWarmth }: WishRitualProps) {
-  const { connected, publicKey, disconnecting } = useWallet();
+  const { connected, publicKey, disconnecting, sendTransaction } = useWallet();
+  const { connection } = useConnection();
   const { address, status, refresh, setStatus } = useWishStatus();
   const [phase, setPhase] = useState<Phase>("gate");
   const [text, setText] = useState("");
@@ -29,7 +31,20 @@ export function WishRitual({ onClose, onWarmth }: WishRitualProps) {
   const [wishNumber, setWishNumber] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [shake, setShake] = useState(false);
+  const [cfg, setCfg] = useState<TreasuryConfig | null>(null);
+  const [payStatus, setPayStatus] = useState<string>("");
   const submittingRef = useRef(false);
+
+  // Load the treasury config once so we know the price / whether to charge.
+  useEffect(() => {
+    let alive = true;
+    void getTreasuryConfig().then((c) => {
+      if (alive) setCfg(c);
+    });
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   const warmth = useMemo(() => Math.min(1, text.length / 90), [text.length]);
 
@@ -70,7 +85,7 @@ export function WishRitual({ onClose, onWarmth }: WishRitualProps) {
     if (value.length > text.length && value.length % 2 === 0) sound.whisper();
   }, [text.length]);
 
-  const runSequence = useCallback(async () => {
+  const runSequence = useCallback(async (paymentSignature?: string) => {
     if (submittingRef.current || !address) return;
     submittingRef.current = true;
     setError(null);
@@ -84,6 +99,7 @@ export function WishRitual({ onClose, onWarmth }: WishRitualProps) {
         wallet: address,
         wish: text.trim(),
         wish_hash: await wishHash(`${address}:${text.trim()}`),
+        payment_signature: paymentSignature,
       }),
     })
       .then((r) => r.json() as Promise<CreateWishResult>)
@@ -151,6 +167,41 @@ export function WishRitual({ onClose, onWarmth }: WishRitualProps) {
     sound.chime(880);
     submittingRef.current = false;
   }, [address, text, refresh, setStatus]);
+
+  // Collect the USDC offering (if enabled), then run the snap sequence.
+  const handleGrant = useCallback(async () => {
+    if (submittingRef.current) return;
+    setError(null);
+
+    if (!cfg?.paymentsEnabled) {
+      void runSequence();
+      return;
+    }
+    if (!publicKey || !sendTransaction) {
+      setError("Bind a wallet to make your offering.");
+      return;
+    }
+
+    setPhase("pay");
+    setPayStatus("Confirm the offering in your wallet…");
+    sound.chime(520);
+    try {
+      const signature = await payForWish({
+        connection,
+        payer: publicKey,
+        sendTransaction,
+        config: cfg,
+      });
+      setPayStatus("The willow accepts your offering…");
+      await sleep(500);
+      await runSequence(signature);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "The offering was refused.";
+      setError(msg);
+      setPhase("write");
+      sound.dryCrack();
+    }
+  }, [cfg, publicKey, sendTransaction, connection, runSequence]);
 
   const displayedWish = status?.wish?.wish_text ?? text;
 
@@ -283,14 +334,44 @@ export function WishRitual({ onClose, onWarmth }: WishRitualProps) {
                 <button
                   className="btn-ritual w-full max-w-xs"
                   disabled={text.trim().length < 2}
-                  onClick={runSequence}
+                  onClick={handleGrant}
                 >
-                  Grant my wish
+                  {cfg?.paymentsEnabled
+                    ? `Offer ${cfg.priceUsdc} USDC & wish`
+                    : "Grant my wish"}
                 </button>
+                {cfg?.paymentsEnabled && (
+                  <p className="eyebrow opacity-50">
+                    one wish · {cfg.priceUsdc} USDC · non-refundable
+                  </p>
+                )}
                 <p className="eyebrow opacity-40">
                   bound · {truncateAddress(address ?? "")}
                 </p>
               </div>
+            </motion.div>
+          )}
+
+          {/* ── PAY: awaiting the USDC offering ── */}
+          {phase === "pay" && (
+            <motion.div
+              key="pay"
+              initial={{ opacity: 0, y: 12 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -12 }}
+              className="flex flex-col items-center gap-6 text-center"
+            >
+              <p className="eyebrow">an offering is asked</p>
+              <h2 className="prophecy text-3xl text-parchment text-glow-warm sm:text-4xl">
+                {cfg ? `${cfg.priceUsdc} USDC` : "…"}
+              </h2>
+              <motion.p
+                className="max-w-sm text-sm text-muted"
+                animate={{ opacity: [0.5, 1, 0.5] }}
+                transition={{ duration: 2, repeat: Infinity }}
+              >
+                {payStatus || "Speak to your wallet…"}
+              </motion.p>
             </motion.div>
           )}
 

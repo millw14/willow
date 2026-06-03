@@ -35,6 +35,7 @@ export const SEED_WISHES: Wish[] = RAW.map((r, i) => {
     wish_number: 143_901 + i,
     oracle_response: r.oracle_response,
     wallet_status: "spent",
+    payment_signature: null,
     created_at: created.toISOString(),
   };
 });

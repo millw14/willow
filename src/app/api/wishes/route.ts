@@ -17,14 +17,14 @@ export async function GET(req: Request) {
 }
 
 export async function POST(req: Request) {
-  let body: { wallet?: string; wish?: string; wish_hash?: string };
+  let body: { wallet?: string; wish?: string; wish_hash?: string; payment_signature?: string };
   try {
     body = await req.json();
   } catch {
     return NextResponse.json({ ok: false, error: "Malformed offering." }, { status: 400 });
   }
 
-  const { wallet, wish, wish_hash } = body;
+  const { wallet, wish, wish_hash, payment_signature } = body;
   if (!wallet || !wish || !wish_hash) {
     return NextResponse.json(
       { ok: false, error: "A wish requires a soul, words, and a sigil." },
@@ -32,7 +32,7 @@ export async function POST(req: Request) {
     );
   }
 
-  const result = await createWish(wallet, wish, wish_hash);
+  const result = await createWish(wallet, wish, wish_hash, payment_signature);
   if (!result.ok) {
     return NextResponse.json(result, { status: result.alreadyWished ? 409 : 400 });
   }

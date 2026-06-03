@@ -3,6 +3,9 @@ import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import type { Wish, WishCategory, WishStatus, CreateWishResult } from "@/lib/types";
 import { SEED_WISHES, SEED_BASE_COUNT } from "@/data/seedWishes";
 import { consultOracle } from "@/lib/oracle";
+import { verifyPayment } from "@/lib/payments";
+import { buyAndBurn, type BurnEvent } from "@/lib/buyburn";
+import { paymentsEnabled, BURN_EVERY } from "@/lib/solana";
 
 /**
  * Wish store. Uses Supabase when env keys are present; otherwise falls back to
@@ -37,9 +40,18 @@ function getClient(): SupabaseClient | null {
 interface MemStore {
   wishes: Wish[];
   counter: number;
+  paidCount: number;
+  usedSignatures: Set<string>;
+  burns: BurnEvent[];
 }
 const g = globalThis as unknown as { __owwStore?: MemStore };
-const store: MemStore = (g.__owwStore ??= { wishes: [], counter: SEED_BASE_COUNT });
+const store: MemStore = (g.__owwStore ??= {
+  wishes: [],
+  counter: SEED_BASE_COUNT,
+  paidCount: 0,
+  usedSignatures: new Set<string>(),
+  burns: [],
+});
 const memory = store.wishes;
 
 function normalize(addr: string) {
@@ -135,10 +147,105 @@ function popularity(w: Wish): number {
   return h % 9999;
 }
 
+// ── Paid-wish accounting + buy/burn ──
+
+export async function getPaidWishCount(): Promise<number> {
+  const client = getClient();
+  if (client) {
+    const { count } = await client
+      .from("wishes")
+      .select("*", { count: "exact", head: true })
+      .not("payment_signature", "is", null);
+    return count ?? 0;
+  }
+  return store.paidCount;
+}
+
+async function isSignatureUsed(signature: string): Promise<boolean> {
+  const client = getClient();
+  if (client) {
+    const { data } = await client
+      .from("wishes")
+      .select("id")
+      .eq("payment_signature", signature)
+      .maybeSingle();
+    return Boolean(data);
+  }
+  return store.usedSignatures.has(signature);
+}
+
+export async function recordBurn(event: BurnEvent): Promise<void> {
+  store.burns.unshift(event);
+  const client = getClient();
+  if (client) {
+    await client.from("burns").insert({
+      spent_usdc: event.spent_usdc,
+      burned: event.burned,
+      swap_signature: event.swap_signature,
+      burn_signature: event.burn_signature,
+      status: event.status,
+      reason: event.reason ?? null,
+    });
+  }
+}
+
+export async function getBurns(limit = 20): Promise<BurnEvent[]> {
+  const client = getClient();
+  if (client) {
+    const { data } = await client
+      .from("burns")
+      .select("*")
+      .order("created_at", { ascending: false })
+      .limit(limit);
+    if (data) return data as unknown as BurnEvent[];
+  }
+  return store.burns.slice(0, limit);
+}
+
+/** How many buy-and-burns have actually completed on chain. */
+export async function getCompletedBurnCount(): Promise<number> {
+  const client = getClient();
+  if (client) {
+    const { count } = await client
+      .from("burns")
+      .select("*", { count: "exact", head: true })
+      .eq("status", "completed");
+    return count ?? 0;
+  }
+  return store.burns.filter((b) => b.status === "completed").length;
+}
+
+/**
+ * Burns owed = one per BURN_EVERY paid wishes, minus the ones already done.
+ * This is the crash-safe trigger: a burn that gets cut off mid-flight stays
+ * "owed" and is retried by the next wish or the cron, never double-counted.
+ */
+export async function getPendingBurnCount(): Promise<number> {
+  if (BURN_EVERY <= 0) return 0;
+  const [paid, done] = await Promise.all([getPaidWishCount(), getCompletedBurnCount()]);
+  return Math.max(0, Math.floor(paid / BURN_EVERY) - done);
+}
+
+/** Run a single buy-and-burn if one is owed. Returns the event, or null. */
+export async function runOwedBurn(): Promise<BurnEvent | null> {
+  if ((await getPendingBurnCount()) <= 0) return null;
+  const event = await buyAndBurn();
+  await recordBurn(event);
+  return event;
+}
+
+/** Fire-and-forget an owed burn so the wish response stays snappy. */
+function triggerBurn(): void {
+  void runOwedBurn().catch(() => {
+    /* swallowed — surfaced via /api/buyburn status + retried by cron */
+  });
+}
+
 export async function createWish(
   wallet: string,
   wishText: string,
   wishHashValue: string,
+  paymentSignature?: string,
 ): Promise<CreateWishResult> {
   const address = normalize(wallet);
   const text = wishText.trim();
@@ -146,6 +253,22 @@ export async function createWish(
   if (!address) return { ok: false, alreadyWished: false, error: "No wallet connected." };
   if (text.length < 2) return { ok: false, alreadyWished: false, error: "The Willow heard nothing." };
   if (text.length > 280) return { ok: false, alreadyWished: false, error: "The Willow asks for fewer words." };
+
+  // Payment gate — only when a treasury is configured.
+  const requirePayment = paymentsEnabled();
+  if (requirePayment) {
+    const sig = paymentSignature?.trim();
+    if (!sig) {
+      return { ok: false, alreadyWished: false, error: "An offering of USDC is required." };
+    }
+    if (await isSignatureUsed(sig)) {
+      return { ok: false, alreadyWished: false, error: "That offering was already spent." };
+    }
+    const check = await verifyPayment(sig, address);
+    if (!check.ok) {
+      return { ok: false, alreadyWished: false, error: check.reason ?? "The offering could not be verified." };
+    }
+  }
 
   // One wish per wallet — enforced before we ever call the oracle.
   const existing = await getStatus(address);
@@ -165,6 +288,7 @@ export async function createWish(
     wish_number: wishNumber,
     oracle_response: oracle,
     wallet_status: "spent",
+    payment_signature: requirePayment ? (paymentSignature?.trim() ?? null) : null,
     created_at: new Date().toISOString(),
   };
 
@@ -178,21 +302,36 @@ export async function createWish(
         wish_hash: wish.wish_hash,
         oracle_response: wish.oracle_response,
         wallet_status: wish.wallet_status,
+        payment_signature: wish.payment_signature,
       })
       .select()
       .single();
 
     if (error) {
-      // Unique-violation => this wallet already wished (race / retry).
+      // Unique-violation => wallet already wished, or this offering was reused.
       if (error.code === "23505") {
         return { ok: false, alreadyWished: true, error: "The Willow remembers." };
       }
       return { ok: false, alreadyWished: false, error: "The wood would not take it. Try once more." };
     }
     const saved = { ...wish, ...(data as Partial<Wish>) };
-    return { ok: true, alreadyWished: false, wish: saved, oracle };
+    let burnTriggered = false;
+    if (requirePayment && (await getPendingBurnCount()) > 0) {
+      burnTriggered = true;
+      triggerBurn();
+    }
+    return { ok: true, alreadyWished: false, wish: saved, oracle, burnTriggered };
   }
 
   memory.push(wish);
-  return { ok: true, alreadyWished: false, wish, oracle };
+  let burnTriggered = false;
+  if (requirePayment && wish.payment_signature) {
+    store.usedSignatures.add(wish.payment_signature);
+    store.paidCount += 1;
+    if ((await getPendingBurnCount()) > 0) {
+      burnTriggered = true;
+      triggerBurn();
+    }
+  }
+  return { ok: true, alreadyWished: false, wish, oracle, burnTriggered };
 }
