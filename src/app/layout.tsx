@@ -31,21 +31,31 @@ const grotesk = Space_Grotesk({
   display: "swap",
 });
 
-const siteUrl = "https://onewishwillow.com";
+const siteUrl =
+  process.env.NEXT_PUBLIC_SITE_URL ||
+  (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "https://onewishwillow.com");
 
 export const metadata: Metadata = {
   metadataBase: new URL(siteUrl),
-  title: "One Wish Willow — Everyone Gets One Wish",
+  title: {
+    default: "One Wish Willow — Everyone Gets One Wish",
+    template: "%s · One Wish Willow",
+  },
   description:
     "A mysterious digital ritual where every connected soul receives exactly one wish.",
   keywords: ["one wish willow", "wish", "ritual", "solana", "oracle"],
+  applicationName: "One Wish Willow",
+  icons: {
+    icon: [{ url: "/icon", type: "image/png" }],
+    apple: [{ url: "/apple-icon", type: "image/png" }],
+  },
   openGraph: {
     title: "One Wish Willow — Everyone Gets One Wish",
     description:
       "A mysterious digital ritual where every connected soul receives exactly one wish.",
     url: siteUrl,
     siteName: "One Wish Willow",
-    images: [{ url: "/willow-hero.png", width: 1024, height: 576 }],
+    locale: "en_US",
     type: "website",
   },
   twitter: {
@@ -53,7 +63,10 @@ export const metadata: Metadata = {
     title: "One Wish Willow — Everyone Gets One Wish",
     description:
       "A mysterious digital ritual where every connected soul receives exactly one wish.",
-    images: ["/willow-hero.png"],
+    creator: "@onewishwillow",
+  },
+  alternates: {
+    canonical: siteUrl,
   },
 };
 
