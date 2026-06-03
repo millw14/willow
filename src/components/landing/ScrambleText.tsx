@@ -92,6 +92,8 @@ export function DecryptLine({
 }) {
   const [display, setDisplay] = useState("");
   const doneRef = useRef(false);
+  const onCompleteRef = useRef(onComplete);
+  onCompleteRef.current = onComplete;
 
   useEffect(() => {
     doneRef.current = false;
@@ -127,7 +129,7 @@ export function DecryptLine({
       if (active < 0) {
         if (!doneRef.current) {
           doneRef.current = true;
-          onComplete?.();
+          onCompleteRef.current?.();
         }
         return;
       }
@@ -146,7 +148,7 @@ export function DecryptLine({
       cancelled = true;
       window.clearInterval(id);
     };
-  }, [text, flickerMs, ticksPerLetter, onComplete]);
+  }, [text, flickerMs, ticksPerLetter]);
 
   return <StableLetters className={className} text={display || text} ariaLabel={text} />;
 }

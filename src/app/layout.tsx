@@ -81,9 +81,10 @@ export default function RootLayout({
   children,
 }: Readonly<{ children: React.ReactNode }>) {
   return (
-    <html lang="en">
+    <html lang="en" style={{ backgroundColor: "#080706" }}>
       <body
         className={`${cormorant.variable} ${playfair.variable} ${inter.variable} ${grotesk.variable} font-body antialiased`}
+        style={{ backgroundColor: "#080706", color: "#F6E7D1" }}
       >
         <ClientProviders>{children}</ClientProviders>
         <div className="vignette" aria-hidden />
