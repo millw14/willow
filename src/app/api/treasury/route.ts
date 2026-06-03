@@ -8,6 +8,10 @@ import {
   WISH_PRICE_BASE,
   BURN_EVERY,
   RPC_URL,
+  ACCEPTS_USDC,
+  ACCEPTS_SOL,
+  getSolPriceUsd,
+  wishPriceLamports,
 } from "@/lib/solana";
 import type { TreasuryConfig } from "@/lib/types";
 
@@ -15,6 +19,15 @@ export const dynamic = "force-dynamic";
 
 export async function GET() {
   const treasury = getTreasuryAddress();
+
+  // Fetch the live SOL price only if SOL payments are on; degrade gracefully.
+  let solPriceUsd: number | null = null;
+  let priceLamports: number | null = null;
+  if (ACCEPTS_SOL) {
+    solPriceUsd = await getSolPriceUsd();
+    if (solPriceUsd) priceLamports = wishPriceLamports(solPriceUsd);
+  }
+
   const config: TreasuryConfig = {
     paymentsEnabled: paymentsEnabled(),
     treasury: treasury?.toBase58() ?? null,
@@ -24,6 +37,11 @@ export async function GET() {
     usdcDecimals: USDC_DECIMALS,
     burnEvery: BURN_EVERY,
     rpcUrl: RPC_URL,
+    acceptsUsdc: ACCEPTS_USDC,
+    // SOL is only truly available when we have a live price to size the transfer.
+    acceptsSol: ACCEPTS_SOL && priceLamports !== null,
+    solPriceUsd,
+    priceLamports,
   };
   return NextResponse.json(config);
 }

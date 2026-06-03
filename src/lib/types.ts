@@ -12,6 +12,8 @@ export interface Wish {
   created_at: string;
 }
 
+export type WishCurrency = "usdc" | "sol";
+
 export interface TreasuryConfig {
   paymentsEnabled: boolean;
   treasury: string | null;
@@ -21,6 +23,12 @@ export interface TreasuryConfig {
   usdcDecimals: number;
   burnEvery: number;
   rpcUrl: string;
+  acceptsUsdc: boolean;
+  acceptsSol: boolean;
+  /** Live SOL/USD price, null if unavailable (then SOL is unavailable). */
+  solPriceUsd: number | null;
+  /** Lamports equal to the wish price right now, null if SOL price unavailable. */
+  priceLamports: number | null;
 }
 
 export interface WishStatus {

@@ -5,7 +5,7 @@ import { SEED_WISHES, SEED_BASE_COUNT } from "@/data/seedWishes";
 import { consultOracle } from "@/lib/oracle";
 import { verifyPayment } from "@/lib/payments";
 import { buyAndBurn, type BurnEvent } from "@/lib/buyburn";
-import { paymentsEnabled, BURN_EVERY } from "@/lib/solana";
+import { paymentsEnabled, BURN_EVERY, type WishCurrency } from "@/lib/solana";
 
 /**
  * Wish store. Uses Supabase when env keys are present; otherwise falls back to
@@ -180,6 +180,7 @@ export async function recordBurn(event: BurnEvent): Promise<void> {
   if (client) {
     await client.from("burns").insert({
       spent_usdc: event.spent_usdc,
+      spent_sol: event.spent_sol,
       burned: event.burned,
       swap_signature: event.swap_signature,
       burn_signature: event.burn_signature,
@@ -246,6 +247,7 @@ export async function createWish(
   wishText: string,
   wishHashValue: string,
   paymentSignature?: string,
+  currency: WishCurrency = "usdc",
 ): Promise<CreateWishResult> {
   const address = normalize(wallet);
   const text = wishText.trim();
@@ -259,12 +261,12 @@ export async function createWish(
   if (requirePayment) {
     const sig = paymentSignature?.trim();
     if (!sig) {
-      return { ok: false, alreadyWished: false, error: "An offering of USDC is required." };
+      return { ok: false, alreadyWished: false, error: "An offering is required." };
     }
     if (await isSignatureUsed(sig)) {
       return { ok: false, alreadyWished: false, error: "That offering was already spent." };
     }
-    const check = await verifyPayment(sig, address);
+    const check = await verifyPayment(sig, address, currency);
     if (!check.ok) {
       return { ok: false, alreadyWished: false, error: check.reason ?? "The offering could not be verified." };
     }

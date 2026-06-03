@@ -9,7 +9,7 @@ import { useWishStatus } from "@/hooks/useWishStatus";
 import { ShareCard } from "@/components/share/ShareCard";
 import { wishHash, sleep, truncateAddress } from "@/lib/utils";
 import { getTreasuryConfig, payForWish } from "@/lib/payClient";
-import type { CreateWishResult, TreasuryConfig } from "@/lib/types";
+import type { CreateWishResult, TreasuryConfig, WishCurrency } from "@/lib/types";
 import * as sound from "@/lib/sound";
 
 type Phase = "gate" | "write" | "pay" | "sequence" | "revealed" | "remembers";
@@ -32,6 +32,7 @@ export function WishRitual({ onClose, onWarmth }: WishRitualProps) {
   const [error, setError] = useState<string | null>(null);
   const [shake, setShake] = useState(false);
   const [cfg, setCfg] = useState<TreasuryConfig | null>(null);
+  const [currency, setCurrency] = useState<WishCurrency>("usdc");
   const [payStatus, setPayStatus] = useState<string>("");
   const submittingRef = useRef(false);
 
@@ -39,12 +40,20 @@ export function WishRitual({ onClose, onWarmth }: WishRitualProps) {
   useEffect(() => {
     let alive = true;
     void getTreasuryConfig().then((c) => {
-      if (alive) setCfg(c);
+      if (!alive) return;
+      setCfg(c);
+      // Default to whichever currency is actually available.
+      if (!c.acceptsUsdc && c.acceptsSol) setCurrency("sol");
     });
     return () => {
       alive = false;
     };
   }, []);
+
+  const solPrice = useMemo(() => {
+    if (!cfg?.priceLamports) return null;
+    return cfg.priceLamports / 1_000_000_000;
+  }, [cfg?.priceLamports]);
 
   const warmth = useMemo(() => Math.min(1, text.length / 90), [text.length]);
 
@@ -85,7 +94,7 @@ export function WishRitual({ onClose, onWarmth }: WishRitualProps) {
     if (value.length > text.length && value.length % 2 === 0) sound.whisper();
   }, [text.length]);
 
-  const runSequence = useCallback(async (paymentSignature?: string) => {
+  const runSequence = useCallback(async (paymentSignature?: string, payCurrency?: WishCurrency) => {
     if (submittingRef.current || !address) return;
     submittingRef.current = true;
     setError(null);
@@ -100,6 +109,7 @@ export function WishRitual({ onClose, onWarmth }: WishRitualProps) {
         wish: text.trim(),
         wish_hash: await wishHash(`${address}:${text.trim()}`),
         payment_signature: paymentSignature,
+        currency: payCurrency,
       }),
     })
       .then((r) => r.json() as Promise<CreateWishResult>)
@@ -191,17 +201,18 @@ export function WishRitual({ onClose, onWarmth }: WishRitualProps) {
         payer: publicKey,
         sendTransaction,
         config: cfg,
+        currency,
       });
       setPayStatus("The willow accepts your offering…");
       await sleep(500);
-      await runSequence(signature);
+      await runSequence(signature, currency);
     } catch (e) {
       const msg = e instanceof Error ? e.message : "The offering was refused.";
       setError(msg);
       setPhase("write");
       sound.dryCrack();
     }
-  }, [cfg, publicKey, sendTransaction, connection, runSequence]);
+  }, [cfg, publicKey, sendTransaction, connection, currency, runSequence]);
 
   const displayedWish = status?.wish?.wish_text ?? text;
 
@@ -331,19 +342,46 @@ export function WishRitual({ onClose, onWarmth }: WishRitualProps) {
               </div>
               {error && <p className="text-sm text-error/90">{error}</p>}
               <div className="flex w-full flex-col items-center gap-4">
+                {/* Currency choice — only when both are accepted */}
+                {cfg?.paymentsEnabled && cfg.acceptsUsdc && cfg.acceptsSol && (
+                  <div className="flex items-center gap-1 rounded-full border border-glow/15 p-1">
+                    <button
+                      type="button"
+                      onClick={() => setCurrency("usdc")}
+                      className={`eyebrow rounded-full px-4 py-1.5 transition ${
+                        currency === "usdc"
+                          ? "bg-glow/20 text-parchment"
+                          : "text-muted hover:text-parchment"
+                      }`}
+                    >
+                      {cfg.priceUsdc} USDC
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setCurrency("sol")}
+                      className={`eyebrow rounded-full px-4 py-1.5 transition ${
+                        currency === "sol"
+                          ? "bg-glow/20 text-parchment"
+                          : "text-muted hover:text-parchment"
+                      }`}
+                    >
+                      {solPrice ? `${solPrice.toFixed(3)} SOL` : "SOL"}
+                    </button>
+                  </div>
+                )}
                 <button
                   className="btn-ritual w-full max-w-xs"
                   disabled={text.trim().length < 2}
                   onClick={handleGrant}
                 >
-                  {cfg?.paymentsEnabled
-                    ? `Offer ${cfg.priceUsdc} USDC & wish`
-                    : "Grant my wish"}
+                  {!cfg?.paymentsEnabled
+                    ? "Grant my wish"
+                    : currency === "sol" && solPrice
+                      ? `Offer ${solPrice.toFixed(3)} SOL & wish`
+                      : `Offer ${cfg.priceUsdc} USDC & wish`}
                 </button>
                 {cfg?.paymentsEnabled && (
-                  <p className="eyebrow opacity-50">
-                    one wish · {cfg.priceUsdc} USDC · non-refundable
-                  </p>
+                  <p className="eyebrow opacity-50">one wish · non-refundable</p>
                 )}
                 <p className="eyebrow opacity-40">
                   bound · {truncateAddress(address ?? "")}
@@ -363,7 +401,11 @@ export function WishRitual({ onClose, onWarmth }: WishRitualProps) {
             >
               <p className="eyebrow">an offering is asked</p>
               <h2 className="prophecy text-3xl text-parchment text-glow-warm sm:text-4xl">
-                {cfg ? `${cfg.priceUsdc} USDC` : "…"}
+                {!cfg
+                  ? "…"
+                  : currency === "sol" && solPrice
+                    ? `${solPrice.toFixed(3)} SOL`
+                    : `${cfg.priceUsdc} USDC`}
               </h2>
               <motion.p
                 className="max-w-sm text-sm text-muted"

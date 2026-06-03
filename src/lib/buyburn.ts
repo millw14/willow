@@ -11,6 +11,7 @@ import {
   getTokenProgramId,
   ataFor,
   USDC_MINT,
+  SOL_MINT,
   WISH_TOKEN_MINT,
   FEE_RESERVE_RATIO,
 } from "@/lib/solana";
@@ -18,6 +19,7 @@ import {
 export interface BurnEvent {
   id: string;
   spent_usdc: number; // base units of USDC swapped
+  spent_sol: number; // lamports of SOL swapped
   burned: number; // base units of token burned
   swap_signature: string | null;
   burn_signature: string | null;
@@ -29,9 +31,9 @@ export interface BurnEvent {
 const JUP_BASE = process.env.JUPITER_API_URL || "https://lite-api.jup.ag/swap/v1";
 const JUP_API_KEY = process.env.JUPITER_API_KEY || "";
 const SLIPPAGE_BPS = Number(process.env.JUP_SLIPPAGE_BPS || "500");
-// Don't bother swapping dust or risking a run without gas.
-const MIN_SWAP_BASE = Number(process.env.MIN_SWAP_USDC || "0.05") * 1_000_000;
-const MIN_SOL_LAMPORTS = 5_000_000; // ~0.005 SOL for fees
+const MIN_SWAP_USDC_BASE = Number(process.env.MIN_SWAP_USDC || "0.05") * 1_000_000;
+const MIN_SWAP_SOL_LAMPORTS = Number(process.env.MIN_SWAP_SOL || "0.005") * 1_000_000_000;
+const MIN_SOL_LAMPORTS = 8_000_000; // ~0.008 SOL kept for fees at minimum
 
 let running = false;
 
@@ -65,109 +67,131 @@ async function tokenBalance(ata: PublicKey): Promise<bigint> {
   }
 }
 
+/** Swap `amount` base units of `inputMint` into the wish token, into treasury. */
+async function swapToToken(
+  inputMint: PublicKey,
+  amount: bigint,
+  wrapAndUnwrapSol: boolean,
+): Promise<{ ok: boolean; signature: string | null; reason?: string }> {
+  const treasury = getTreasury()!;
+  const conn = getConnection();
+
+  const quoteUrl =
+    `${JUP_BASE}/quote?inputMint=${inputMint.toBase58()}` +
+    `&outputMint=${WISH_TOKEN_MINT.toBase58()}` +
+    `&amount=${amount.toString()}` +
+    `&slippageBps=${SLIPPAGE_BPS}&swapMode=ExactIn`;
+
+  const quoteRes = await fetch(quoteUrl, { headers: jupHeaders() });
+  if (!quoteRes.ok) return { ok: false, signature: null, reason: `Quote failed (${quoteRes.status}).` };
+  const quote = await quoteRes.json();
+  if (quote.error) return { ok: false, signature: null, reason: `Quote: ${quote.error}` };
+
+  const swapRes = await fetch(`${JUP_BASE}/swap`, {
+    method: "POST",
+    headers: jupHeaders(),
+    body: JSON.stringify({
+      quoteResponse: quote,
+      userPublicKey: treasury.publicKey.toBase58(),
+      wrapAndUnwrapSol,
+      dynamicComputeUnitLimit: true,
+      prioritizationFeeLamports: {
+        priorityLevelWithMaxLamports: { maxLamports: 1_000_000, priorityLevel: "medium" },
+      },
+    }),
+  });
+  if (!swapRes.ok) return { ok: false, signature: null, reason: `Swap build failed (${swapRes.status}).` };
+  const swapJson = await swapRes.json();
+  if (!swapJson.swapTransaction) return { ok: false, signature: null, reason: "No swap transaction." };
+
+  const swapTx = VersionedTransaction.deserialize(Buffer.from(swapJson.swapTransaction, "base64"));
+  swapTx.sign([treasury]);
+  const sig = await conn.sendRawTransaction(swapTx.serialize(), { skipPreflight: false, maxRetries: 3 });
+  const ok = await pollConfirm(sig);
+  return { ok, signature: sig, reason: ok ? undefined : "Swap did not confirm." };
+}
+
 /**
- * Buy & burn: swap 90% of the treasury's USDC into the wish token, then burn
- * every token received. Leaves FEE_RESERVE_RATIO (default 10%) of USDC behind
- * for fees. Safe to call repeatedly; a lock prevents overlapping runs.
+ * Buy & burn: swap the treasury's spendable USDC *and* SOL into the wish token,
+ * then burn every token received. Leaves FEE_RESERVE_RATIO (default 10%) of each
+ * balance behind for fees. Safe to call repeatedly; a lock prevents overlapping
+ * runs.
  */
 export async function buyAndBurn(): Promise<BurnEvent> {
-  const now = new Date().toISOString();
   const base: BurnEvent = {
     id: `burn-${Date.now()}`,
     spent_usdc: 0,
+    spent_sol: 0,
     burned: 0,
     swap_signature: null,
     burn_signature: null,
     status: "skipped",
-    created_at: now,
+    created_at: new Date().toISOString(),
   };
 
   const treasury = getTreasury();
   if (!treasury) return { ...base, reason: "Treasury not configured." };
-
   if (running) return { ...base, reason: "A burn is already in progress." };
   running = true;
 
   try {
     const conn = getConnection();
 
-    // Gas check — never strand the treasury without fees.
-    const sol = await conn.getBalance(treasury.publicKey);
-    if (sol < MIN_SOL_LAMPORTS) {
+    const solBalance = await conn.getBalance(treasury.publicKey);
+    if (solBalance < MIN_SOL_LAMPORTS) {
       return { ...base, reason: "Treasury low on SOL for fees." };
     }
 
-    // How much USDC can we spend? Leave the reserve behind.
+    // Spendable USDC: 90% of balance.
     const usdcAta = ataFor(USDC_MINT, treasury.publicKey);
     const usdcBalance = await tokenBalance(usdcAta);
-    const spendable = (usdcBalance * BigInt(Math.round((1 - FEE_RESERVE_RATIO) * 1000))) / 1000n;
+    const usdcSpendable = (usdcBalance * BigInt(Math.round((1 - FEE_RESERVE_RATIO) * 1000))) / 1000n;
 
-    if (spendable < BigInt(Math.floor(MIN_SWAP_BASE))) {
-      return { ...base, reason: "Not enough USDC to buy & burn yet." };
+    // Spendable SOL: balance minus a reserve (max of 10% or the fee floor).
+    const reserve = Math.max(Math.floor(solBalance * FEE_RESERVE_RATIO), MIN_SOL_LAMPORTS);
+    const solSpendable = BigInt(Math.max(0, solBalance - reserve));
+
+    const doUsdc = usdcSpendable >= BigInt(Math.floor(MIN_SWAP_USDC_BASE));
+    const doSol = solSpendable >= BigInt(Math.floor(MIN_SWAP_SOL_LAMPORTS));
+
+    if (!doUsdc && !doSol) {
+      return { ...base, reason: "Not enough USDC or SOL to buy & burn yet." };
     }
 
-    // ── 1. Jupiter quote (USDC -> wish token, exact in) ──
-    const quoteUrl =
-      `${JUP_BASE}/quote?inputMint=${USDC_MINT.toBase58()}` +
-      `&outputMint=${WISH_TOKEN_MINT.toBase58()}` +
-      `&amount=${spendable.toString()}` +
-      `&slippageBps=${SLIPPAGE_BPS}&swapMode=ExactIn`;
+    let spentUsdc = 0;
+    let spentSol = 0;
+    let lastSwapSig: string | null = null;
+    let anySwapOk = false;
+    const reasons: string[] = [];
 
-    const quoteRes = await fetch(quoteUrl, { headers: jupHeaders() });
-    if (!quoteRes.ok) {
-      return { ...base, status: "failed", reason: `Quote failed (${quoteRes.status}).` };
-    }
-    const quote = await quoteRes.json();
-    if (quote.error) {
-      return { ...base, status: "failed", reason: `Quote: ${quote.error}` };
-    }
-
-    // ── 2. Jupiter swap transaction ──
-    const swapRes = await fetch(`${JUP_BASE}/swap`, {
-      method: "POST",
-      headers: jupHeaders(),
-      body: JSON.stringify({
-        quoteResponse: quote,
-        userPublicKey: treasury.publicKey.toBase58(),
-        wrapAndUnwrapSol: false,
-        dynamicComputeUnitLimit: true,
-        prioritizationFeeLamports: {
-          priorityLevelWithMaxLamports: {
-            maxLamports: 1_000_000,
-            priorityLevel: "medium",
-          },
-        },
-      }),
-    });
-    if (!swapRes.ok) {
-      return { ...base, status: "failed", reason: `Swap build failed (${swapRes.status}).` };
-    }
-    const swapJson = await swapRes.json();
-    if (!swapJson.swapTransaction) {
-      return { ...base, status: "failed", reason: "Swap: no transaction returned." };
+    if (doUsdc) {
+      const r = await swapToToken(USDC_MINT, usdcSpendable, false);
+      lastSwapSig = r.signature ?? lastSwapSig;
+      if (r.ok) {
+        anySwapOk = true;
+        spentUsdc = Number(usdcSpendable);
+      } else if (r.reason) reasons.push(`USDC: ${r.reason}`);
     }
 
-    const swapTx = VersionedTransaction.deserialize(
-      Buffer.from(swapJson.swapTransaction, "base64"),
-    );
-    swapTx.sign([treasury]);
+    if (doSol) {
+      const r = await swapToToken(SOL_MINT, solSpendable, true);
+      lastSwapSig = r.signature ?? lastSwapSig;
+      if (r.ok) {
+        anySwapOk = true;
+        spentSol = Number(solSpendable);
+      } else if (r.reason) reasons.push(`SOL: ${r.reason}`);
+    }
 
-    const swapSig = await conn.sendRawTransaction(swapTx.serialize(), {
-      skipPreflight: false,
-      maxRetries: 3,
-    });
-    const swapOk = await pollConfirm(swapSig);
-    if (!swapOk) {
+    if (!anySwapOk) {
       return {
         ...base,
         status: "failed",
-        swap_signature: swapSig,
-        spent_usdc: Number(spendable),
-        reason: "Swap did not confirm.",
+        swap_signature: lastSwapSig,
+        reason: reasons.join(" ") || "Swaps did not confirm.",
       };
     }
 
-    // ── 3. Burn everything we just bought ──
+    // ── Burn everything we just bought ──
     const tokenProgram = await getTokenProgramId(WISH_TOKEN_MINT);
     const wishAta = ataFor(WISH_TOKEN_MINT, treasury.publicKey, tokenProgram);
     const toBurn = await tokenBalance(wishAta);
@@ -176,10 +200,11 @@ export async function buyAndBurn(): Promise<BurnEvent> {
       return {
         ...base,
         status: "completed",
-        swap_signature: swapSig,
-        spent_usdc: Number(spendable),
+        swap_signature: lastSwapSig,
+        spent_usdc: spentUsdc,
+        spent_sol: spentSol,
         burned: 0,
-        reason: "Swapped, but no tokens to burn (already routed?).",
+        reason: "Swapped, but no tokens to burn.",
       };
     }
 
@@ -192,7 +217,7 @@ export async function buyAndBurn(): Promise<BurnEvent> {
       tokenProgram,
     );
 
-    const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("confirmed");
+    const { blockhash } = await conn.getLatestBlockhash("confirmed");
     const msg = new TransactionMessage({
       payerKey: treasury.publicKey,
       recentBlockhash: blockhash,
@@ -205,17 +230,17 @@ export async function buyAndBurn(): Promise<BurnEvent> {
       skipPreflight: false,
       maxRetries: 3,
     });
-    void lastValidBlockHeight;
     const burnOk = await pollConfirm(burnSig);
 
     return {
       ...base,
       status: burnOk ? "completed" : "failed",
-      swap_signature: swapSig,
+      swap_signature: lastSwapSig,
       burn_signature: burnSig,
-      spent_usdc: Number(spendable),
+      spent_usdc: spentUsdc,
+      spent_sol: spentSol,
       burned: Number(toBurn),
-      reason: burnOk ? undefined : "Burn did not confirm.",
+      reason: burnOk ? (reasons.length ? reasons.join(" ") : undefined) : "Burn did not confirm.",
     };
   } catch (err) {
     return {
